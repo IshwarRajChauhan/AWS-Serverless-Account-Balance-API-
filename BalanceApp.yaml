@@ -1,0 +1,196 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Serverless Account Balance API using S3, Lambda, and API Gateway
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "S3 Bucket And IAM Role"
+        Parameters:
+          - BucketNameParameter
+          - LambdaRoleNameParameter
+
+      - Label:
+          default: "Lambda Parameters"
+        Parameters:
+          - LambdaRuntimeParameter
+
+      - Label:
+          default: "API Gateway"
+        Parameters:
+          - RESTAPINameParameter
+          - APIStageParameter
+
+Parameters:
+  BucketNameParameter:
+    Description: Enter the name of S3 bucket
+    Type: String
+
+  LambdaRoleNameParameter:
+    Description: Enter the name of Lambda IAM Role
+    Type: String
+
+  LambdaRuntimeParameter:
+    Description: Enter the Lambda Runtime
+    Type: String
+    Default: python3.14
+    AllowedValues:
+      - python3.12
+      - python3.13
+      - python3.14
+
+  RESTAPINameParameter:
+    Description: Enter the name of the REST API
+    Type: String
+
+  APIStageParameter:
+    Description: Enter the Stage name
+    Type: String
+    Default: Prod
+    AllowedValues:
+      - Prod
+      - Dev
+
+Resources:
+
+  bankingS3bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Ref: BucketNameParameter
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Ref: LambdaRoleNameParameter
+      Description: IAM Role for Lambda to access S3 Bucket (demo-level)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  Lambdafunction:
+    DependsOn: LambdaExecutionRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime:
+        Ref: LambdaRuntimeParameter
+      Role:
+        Fn::GetAtt:
+          - LambdaExecutionRole
+          - Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET_NAME:
+            Ref: BucketNameParameter
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+
+              try:
+
+                  bucket = os.environ['BUCKET_NAME']
+
+                  params = event.get('queryStringParameters')
+
+                  if not params or 'accountNumber' not in params:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'accountNumber query parameter required'})
+                      }
+
+                  account_number = params['accountNumber']
+                  key = f"{account_number}.json"
+
+                  response = s3.get_object(
+                      Bucket=bucket,
+                      Key=key
+                  )
+
+                  data = response['Body'].read().decode('utf-8')
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': data
+                  }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(str(e))
+                  }
+
+  BankingRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name:
+        Ref: RESTAPINameParameter
+      Description: Serverless Account Balance API
+
+  bankingstatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId:
+        Fn::GetAtt:
+          - BankingRestAPI
+          - RootResourceId
+      PathPart: balancestatus01
+      RestApiId:
+        Ref: BankingRestAPI
+
+  bankingstatusmethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: BankingRestAPI
+      ResourceId:
+        Ref: bankingstatusResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Lambdafunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+
+  APIDeployment:
+    DependsOn: bankingstatusmethod
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: BankingRestAPI
+      StageName:
+        Ref: APIStageParameter
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: Lambdafunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount:
+        Ref: AWS::AccountId
